@@ -1,4 +1,5 @@
 import UIKit
+import MachO
 
 /// Detects whether we are running as a *guest* app inside LiveContainer.
 ///
