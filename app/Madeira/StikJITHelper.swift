@@ -1,5 +1,62 @@
 import UIKit
 
+/// Detects whether we are running as a *guest* app inside LiveContainer.
+///
+/// LiveContainer does not launch guest apps as their own process. It patches
+/// the guest executable into a dylib and loads it into ITS OWN process
+/// (see LiveContainer docs: "Change MH_EXECUTE to MH_DYLIB" / "Inject a load
+/// command to load TweakLoader.dylib"). Practically this means, once we are
+/// running under LiveContainer:
+///   - `Bundle.main` / the process's registered CFBundleURLTypes and
+///     LSApplicationQueriesSchemes belong to the LiveContainer.app host, not
+///     to Madeira's own Info.plist. Our own "stikjit" LSApplicationQueriesSchemes
+///     entry is never actually registered with the OS.
+///   - Custom URL scheme round-trips are explicitly listed by LiveContainer
+///     as unreliable ("Querying custom URL schemes might not work(?)").
+///   - JIT is entirely LiveContainer's responsibility: the user selects a
+///     "JIT enabler" (StikDebug, recommended for iOS 17.4–18.x) in
+///     LiveContainer's settings and enables "Launch with JIT" for the app.
+///     LiveContainer performs the whole attach handshake itself BEFORE our
+///     code ever runs, so by the time `applicationDidFinishLaunching`-style
+///     code executes, CS_DEBUGGED is either already set or never will be for
+///     this launch.
+///
+/// So, doing our OWN "stikjit://enable-jit" round-trip on top of that is not
+/// just redundant — it actively fights LiveContainer: it can target the
+/// wrong bundle id (LiveContainer's, since `Bundle.main.bundleIdentifier`
+/// no longer reflects Madeira once loaded as a guest dylib), and if StikDebug
+/// is still installed standalone it may accept the request and start a
+/// second, conflicting `vAttach` against a process that may already have a
+/// debugger session from LiveContainer's own flow. That double-attach /
+/// mismatched-target situation is what produces the "JIT not detected, then
+/// crashes right after" behavior — the app proceeds to run BRK-based debugger
+/// protocol commands against a session that isn't the one it thinks it has.
+enum LiveContainerCompat {
+    /// True once this value has been computed, cached for the process lifetime.
+    static let isLiveContainer: Bool = detect()
+
+    private static func detect() -> Bool {
+        // 1) LiveContainer injects TweakLoader.dylib into every guest process.
+        //    Its presence in the loaded-image list is a reliable, documented
+        //    signal that we are not running as our own standalone process.
+        let imageCount = _dyld_image_count()
+        for i in 0..<imageCount {
+            guard let namePtr = _dyld_get_image_name(i) else { continue }
+            let path = String(cString: namePtr)
+            if path.contains("LiveContainer") || path.contains("TweakLoader") {
+                return true
+            }
+        }
+        // 2) Fallback: the OS-level main bundle (the actual signed app on
+        //    disk) is LiveContainer.app itself when we're a guest, even
+        //    though our own Info.plist / source tree calls itself Madeira.
+        if Bundle.main.bundlePath.contains("LiveContainer") {
+            return true
+        }
+        return false
+    }
+}
+
 /// Helper to enable JIT via StikDebug/StikJIT URL scheme.
 /// Opens StikDebug with an embedded script, polls for CS_DEBUGGED,
 /// then allocates JIT memory and detaches the debugger.
@@ -22,14 +79,46 @@ enum StikJITHelper {
     }
 
     /// Check if StikDebug or StikJIT is available by trying to open their URL.
+    ///
+    /// Under LiveContainer, `canOpenURL` reflects LiveContainer.app's own
+    /// LSApplicationQueriesSchemes, not Madeira's — LiveContainer itself
+    /// notes that "querying custom URL schemes might not work" for guest
+    /// apps. Report availability based on what actually matters there: does
+    /// LiveContainer already have us attached.
     static var isAvailable: Bool {
+        if LiveContainerCompat.isLiveContainer {
+            return jit_check_debugged()
+        }
         guard let url = URL(string: "stikjit://enable-jit") else { return false }
         return UIApplication.shared.canOpenURL(url)
     }
 
     /// Open StikDebug with our JIT script embedded in the URL.
     /// StikDebug will attach to our process and run the script.
+    ///
+    /// Under LiveContainer this handshake must NOT run: LiveContainer already
+    /// owns JIT for the whole process (see `LiveContainerCompat`). Calling
+    /// out to "stikjit://" a second time here targets the wrong bundle id and
+    /// risks a conflicting second attach, which is what was crashing the app
+    /// right after JIT failed to be detected. Instead we just check whatever
+    /// state LiveContainer already put us in.
     static func enableJIT(completion: @escaping (Bool) -> Void) {
+        if LiveContainerCompat.isLiveContainer {
+            if jit_check_debugged() {
+                LogStore.shared.log("Running under LiveContainer — JIT already attached by LiveContainer.", level: .success)
+                completion(true)
+            } else {
+                LogStore.shared.log(
+                    "Running under LiveContainer without JIT. Madeira can't request JIT itself here — " +
+                    "long-press Madeira in LiveContainer, open Settings, enable \"Launch with JIT\", set " +
+                    "your JIT enabler to StikDebug (recommended for iOS 18), then relaunch from LiveContainer.",
+                    level: .error
+                )
+                completion(false)
+            }
+            return
+        }
+
         let bundleId = Bundle.main.bundleIdentifier ?? "com.madeira.emulator"
 
         // Build the URL with script data

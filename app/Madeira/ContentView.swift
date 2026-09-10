@@ -1720,7 +1720,19 @@ struct ContentView: View {
 
     private func enableJITViaStikDebug() {
         jitStatus = .testing
-        logStore.log("Requesting JIT via StikDebug URL scheme...")
+
+        if LiveContainerCompat.isLiveContainer {
+            // Do NOT do our own "stikjit://" round-trip here. Under
+            // LiveContainer that call targets the wrong bundle id (ours
+            // reports LiveContainer's, not Madeira's) and can start a second,
+            // conflicting debugger attach on top of whatever LiveContainer
+            // already did — that's what was causing "JIT not detected, then
+            // crash right after". LiveContainer must be the one to attach,
+            // before Madeira is even launched.
+            logStore.log("Running under LiveContainer — checking JIT state set up by LiveContainer...")
+        } else {
+            logStore.log("Requesting JIT via StikDebug URL scheme...")
+        }
 
         StikJITHelper.enableJIT { success in
             if success {
@@ -1728,7 +1740,16 @@ struct ContentView: View {
                 logStore.log("JIT enabled! Debugger attached.", level: .success)
             } else {
                 jitStatus = .unavailable
-                logStore.log("Failed to enable JIT via StikDebug", level: .error)
+                if LiveContainerCompat.isLiveContainer {
+                    logStore.log(
+                        "JIT is not attached. In LiveContainer: long-press Madeira → Settings → " +
+                        "enable \"Launch with JIT\" → set JIT enabler to StikDebug (recommended on iOS 18) " +
+                        "→ Run. Madeira can't self-request JIT while hosted inside LiveContainer.",
+                        level: .error
+                    )
+                } else {
+                    logStore.log("Failed to enable JIT via StikDebug", level: .error)
+                }
             }
         }
     }
